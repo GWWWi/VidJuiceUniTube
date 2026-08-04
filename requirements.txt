@@ -1,0 +1,23 @@
+# ==== 核心引擎 ====
+yt-dlp>=2024.12.13          # 视频解析与下载引擎（不锁死上限，站点适配依赖频繁更新）
+
+# ==== GUI ====
+PySide6>=6.6.0,<6.9.0       # Qt6 官方 Python 绑定（LGPL，商用友好）
+# 注：内置浏览器登录（需求 #3）依赖 PySide6.QtWebEngineWidgets，它**不在**
+# PySide6-Essentials 中，而是由 PySide6-Addons 提供。
+# 直接 `pip install PySide6`（本行声明）会同时拉入 Essentials + Addons，开箱可用；
+# 但若环境里只装了 PySide6-Essentials，应用可正常启动、打包也不报错，
+# 只有点「YouTube 登录（内置浏览器）」时才抛 RuntimeError。
+# 该情况请补装：pip install PySide6-Addons
+# （注意：不存在名为 PySide6-WebEngine 的包，别照着装。）
+# build.spec 已将 QtWebEngine 依赖链加入 hiddenimports，build.py 打包前会硬校验。
+
+# ==== 网络与工具 ====
+requests>=2.31.0            # 缩略图下载、版本检查
+certifi>=2024.2.2           # 打包后 SSL 证书兜底（PyInstaller 必备）
+
+# ==== 可选加速（yt-dlp 推荐）====
+brotli>=1.1.0               # 解压 br 编码响应
+websockets>=12.0            # 部分站点（如 Bilibili 直播）需要
+mutagen>=1.47.0             # 音频元数据写入（yt-dlp 后处理依赖）
+pycryptodomex>=3.20.0       # 部分加密流解密（yt-dlp 可选依赖）

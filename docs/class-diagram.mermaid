@@ -1,0 +1,266 @@
+classDiagram
+    direction LR
+
+    class TaskStatus {
+        <<enumeration>>
+        QUEUED
+        PARSING
+        DOWNLOADING
+        MERGING
+        PAUSED
+        COMPLETED
+        FAILED
+        CANCELED
+    }
+
+    class MediaFormat {
+        +str format_id
+        +str ext
+        +str resolution
+        +int~None~ height
+        +int~None~ fps
+        +float~None~ filesize
+        +str vcodec
+        +str acodec
+        +bool needs_merge
+        +str label
+        +from_ydl_dict(d: dict) MediaFormat$
+        +display_text() str
+    }
+
+    class MediaInfo {
+        +str url
+        +str title
+        +str~None~ uploader
+        +int~None~ duration
+        +str~None~ thumbnail
+        +str extractor
+        +list~MediaFormat~ formats
+        +best_format() MediaFormat
+        +filter_video_formats() list~MediaFormat~
+    }
+
+    class ProgressInfo {
+        +float percent
+        +float speed
+        +int downloaded
+        +int~None~ total
+        +float~None~ eta
+        +str phase
+        +to_dict() dict
+        +from_hook(d: dict) ProgressInfo$
+    }
+
+    class DownloadTask {
+        +str task_id
+        +str url
+        +str title
+        +str format_id
+        +str ext
+        +str resolution
+        +str output_dir
+        +str~None~ filepath
+        +TaskStatus status
+        +ProgressInfo progress
+        +str~None~ error_message
+        +int retry_count
+        +int max_retries
+        +float created_at
+        +float~None~ finished_at
+        +bool needs_merge
+        +__init__(url: str, title: str, fmt: MediaFormat, output_dir: str)
+        +to_dict() dict
+        +from_dict(d: dict) DownloadTask$
+        +is_active() bool
+        +can_resume() bool
+    }
+
+    class ConfigStore {
+        -str _path
+        -dict _data
+        -dict DEFAULTS$
+        +__init__(path: str = None)
+        +load() dict
+        +save() None
+        +get(key: str, default) Any
+        +set(key: str, value) None
+        +download_dir() str
+        +max_concurrent() int
+        +max_retries() int
+        +cookiefile() str~None~
+        +ffmpeg_path() str~None~
+    }
+
+    class HistoryStore {
+        -str _path
+        -Connection _conn
+        +__init__(path: str = None)
+        +init_db() None
+        +add(task: DownloadTask) None
+        +list_all(limit: int = 500) list~dict~
+        +search(keyword: str) list~dict~
+        +delete(record_id: int) None
+        +clear() None
+        +close() None
+    }
+
+    class YtDlpClient {
+        -ConfigStore _config
+        +__init__(config: ConfigStore)
+        +build_opts(extra: dict) dict
+        +extract_info(url: str) MediaInfo
+        +download(task: DownloadTask, hook: Callable, abort_flag: Event) str
+        +probe_error(exc: Exception) str$
+    }
+
+    class FfmpegMerger {
+        -str _ffmpeg_path
+        +__init__(ffmpeg_path: str = None)
+        +is_available() bool
+        +merge(video_path: str, audio_path: str, out_path: str) str
+        +resolve_binary() str$
+    }
+
+    class WorkerSignals {
+        +Signal parse_finished
+        +Signal parse_failed
+        +Signal task_progress
+        +Signal task_status_changed
+        +Signal task_finished
+        +Signal task_failed
+        +Signal log_message
+    }
+
+    class ParseWorker {
+        +WorkerSignals signals
+        -str _url
+        -YtDlpClient _client
+        +__init__(url: str, client: YtDlpClient)
+        +run() None
+    }
+
+    class DownloadWorker {
+        +WorkerSignals signals
+        -DownloadTask _task
+        -YtDlpClient _client
+        -FfmpegMerger _merger
+        -Event _abort
+        -Event _pause
+        +__init__(task: DownloadTask, client: YtDlpClient, merger: FfmpegMerger)
+        +run() None
+        +pause() None
+        +cancel() None
+        -_on_progress(d: dict) None
+    }
+
+    class DownloadManager {
+        -dict~str,DownloadTask~ _tasks
+        -dict~str,DownloadWorker~ _workers
+        -deque _queue
+        -QThreadPool _pool
+        -ConfigStore _config
+        -YtDlpClient _client
+        -FfmpegMerger _merger
+        -HistoryStore _history
+        +Signal task_added
+        +Signal task_updated
+        +Signal stats_updated
+        +__init__(config, client, merger, history)
+        +parse(url: str) None
+        +add_task(info: MediaInfo, fmt: MediaFormat) str
+        +start_task(task_id: str) None
+        +pause_task(task_id: str) None
+        +resume_task(task_id: str) None
+        +cancel_task(task_id: str) None
+        +retry_task(task_id: str) None
+        +open_folder(task_id: str) None
+        +global_stats() dict
+        -_schedule() None
+        -_on_task_finished(task_id: str, filepath: str) None
+        -_on_task_failed(task_id: str, msg: str) None
+    }
+
+    class DownloadTableModel {
+        -list~DownloadTask~ _rows
+        -dict~str,int~ _index
+        +COLUMNS: list$
+        +rowCount(parent) int
+        +columnCount(parent) int
+        +data(index, role) Any
+        +headerData(section, orient, role) Any
+        +add_task(task: DownloadTask) None
+        +update_task(task_id: str) None
+        +task_at(row: int) DownloadTask
+    }
+
+    class ProgressBarDelegate {
+        +paint(painter, option, index) None
+    }
+
+    class MainWindow {
+        -DownloadManager _manager
+        -ConfigStore _config
+        -UrlInputBar _url_bar
+        -ParsePanel _parse_panel
+        -DownloadTableView _table
+        -StatusBarWidget _status
+        +__init__(manager: DownloadManager, config: ConfigStore)
+        +on_parse_clicked() None
+        +on_parse_finished(info: MediaInfo) None
+        +on_download_clicked() None
+        +on_task_updated(task_id: str) None
+        +on_stats_updated(stats: dict) None
+        +open_settings() None
+        +open_history() None
+        +closeEvent(event) None
+    }
+
+    class ParsePanel {
+        +Signal download_requested
+        +set_info(info: MediaInfo) None
+        +selected_format() MediaFormat
+        +clear() None
+    }
+
+    class SettingsDialog {
+        -ConfigStore _config
+        +load_values() None
+        +accept() None
+    }
+
+    class HistoryDialog {
+        -HistoryStore _history
+        +Signal redownload_requested
+        +refresh(keyword: str = "") None
+    }
+
+    MediaInfo "1" o-- "*" MediaFormat : contains
+    DownloadTask "1" *-- "1" ProgressInfo : holds
+    DownloadTask ..> MediaFormat : created from
+    DownloadTask ..> TaskStatus : uses
+
+    DownloadManager "1" o-- "*" DownloadTask : manages
+    DownloadManager "1" o-- "*" DownloadWorker : dispatches
+    DownloadManager --> ConfigStore : reads
+    DownloadManager --> YtDlpClient : uses
+    DownloadManager --> FfmpegMerger : uses
+    DownloadManager --> HistoryStore : writes
+
+    ParseWorker --> YtDlpClient : uses
+    ParseWorker *-- WorkerSignals
+    DownloadWorker *-- WorkerSignals
+    DownloadWorker --> YtDlpClient : uses
+    DownloadWorker --> FfmpegMerger : uses
+    DownloadWorker --> DownloadTask : mutates
+
+    YtDlpClient --> ConfigStore : reads
+
+    MainWindow --> DownloadManager : commands
+    MainWindow *-- ParsePanel
+    MainWindow *-- DownloadTableModel
+    MainWindow ..> SettingsDialog : opens
+    MainWindow ..> HistoryDialog : opens
+    DownloadTableModel o-- DownloadTask : views
+    DownloadTableModel <.. ProgressBarDelegate : renders
+    SettingsDialog --> ConfigStore : writes
+    HistoryDialog --> HistoryStore : reads

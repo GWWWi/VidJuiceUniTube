@@ -1,0 +1,129 @@
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant MW as MainWindow(UI线程)
+    participant DM as DownloadManager(UI线程)
+    participant TP as QThreadPool
+    participant PW as ParseWorker(子线程)
+    participant DW as DownloadWorker(子线程)
+    participant YC as YtDlpClient
+    participant YDL as yt_dlp.YoutubeDL
+    participant FM as FfmpegMerger
+    participant CFG as ConfigStore
+    participant HS as HistoryStore
+
+    Note over U,HS: ========== 流程一：解析链接 ==========
+    U->>MW: 粘贴 URL, 点击[解析]
+    MW->>MW: 校验 URL 非空 / 禁用解析按钮 / 显示 loading
+    MW->>DM: parse(url)
+    DM->>YC: (已注入) 复用单例
+    DM->>PW: new ParseWorker(url, client)
+    DM->>PW: signals.parse_finished.connect(DM._on_parse_ok)
+    DM->>PW: signals.parse_failed.connect(DM._on_parse_err)
+    DM->>TP: start(ParseWorker)
+    TP->>PW: run()
+    PW->>YC: extract_info(url)
+    YC->>CFG: get(cookiefile/proxy/socket_timeout)
+    CFG-->>YC: opts 片段
+    YC->>YDL: YoutubeDL(opts).extract_info(url, download=False)
+    YDL-->>YC: raw dict(formats[])
+    YC->>YC: 过滤/归一化 -> MediaInfo + list[MediaFormat]
+    YC-->>PW: MediaInfo
+    PW-->>DM: emit parse_finished(MediaInfo) [跨线程队列连接]
+    DM-->>MW: emit parse_ready(MediaInfo)
+    MW->>MW: ParsePanel.set_info(info) 填充画质/格式下拉, 默认「最佳画质」
+    MW-->>U: 展示 标题/时长/画质列表, 启用[下载]
+
+    alt 解析失败
+        YDL-->>YC: DownloadError / ExtractorError
+        YC->>YC: probe_error(exc) 映射为中文可读原因
+        YC-->>PW: raise ParseError(msg)
+        PW-->>DM: emit parse_failed(url, msg)
+        DM-->>MW: emit parse_error(msg)
+        MW-->>U: 弹出错误提示(原因 + 建议)
+    end
+
+    Note over U,HS: ========== 流程二：下载一个任务(含进度回传与合并) ==========
+    U->>MW: 选择画质/格式, 点击[下载]
+    MW->>DM: add_task(info, selected_format)
+    DM->>CFG: download_dir(), max_concurrent(), max_retries()
+    CFG-->>DM: 配置值
+    DM->>DM: new DownloadTask(status=QUEUED) 存入 _tasks
+    DM-->>MW: emit task_added(task)
+    MW->>MW: DownloadTableModel.add_task(task) 新增一行
+    DM->>DM: _schedule() 检查 运行中数 < max_concurrent
+
+    DM->>DW: new DownloadWorker(task, client, merger)
+    DM->>DW: signals.task_progress/status_changed/finished/failed 连接到 DM 槽
+    DM->>TP: start(DownloadWorker)
+    DM->>DM: task.status = DOWNLOADING
+    TP->>DW: run()
+
+    DW->>YC: download(task, hook=_on_progress, abort_flag)
+    YC->>YDL: YoutubeDL(opts{format_id, outtmpl, progress_hooks, continuedl})
+    loop 每次 yt-dlp 进度回调(节流 ~300ms)
+        YDL->>DW: progress_hook({status:downloading, ...})
+        DW->>DW: ProgressInfo.from_hook(d)
+        DW-->>DM: emit task_progress(task_id, dict{percent,speed,downloaded,total,eta,phase})
+        DM->>DM: 更新 task.progress
+        DM-->>MW: emit task_updated(task_id)
+        MW->>MW: model.update_task -> dataChanged(该行) 刷新进度条/速度
+        DM->>DM: 汇总 global_stats()
+        DM-->>MW: emit stats_updated({active,completed,total_speed})
+        MW->>MW: 状态栏刷新
+    end
+
+    alt 用户点击[暂停]
+        U->>MW: 暂停
+        MW->>DM: pause_task(task_id)
+        DM->>DW: pause() 置 _pause Event
+        DW->>DW: hook 中检测到 -> raise PauseSignal
+        YDL-->>DW: 中断, 保留 .part 文件
+        DW-->>DM: emit task_status_changed(task_id, PAUSED)
+        DM-->>MW: emit task_updated -> UI 显示「已暂停」
+        U->>MW: 继续
+        MW->>DM: resume_task(task_id)
+        DM->>DM: 重新入队, continuedl=True 断点续传
+    end
+
+    alt 用户点击[取消]
+        U->>MW: 取消
+        MW->>DM: cancel_task(task_id)
+        DM->>DW: cancel() 置 _abort Event
+        DW->>DW: hook raise AbortSignal, 清理 .part/.ytdl 临时文件
+        DW-->>DM: emit task_status_changed(task_id, CANCELED)
+        DM->>DM: _schedule() 释放并发名额
+    end
+
+    YDL-->>YC: 下载完成(返回最终/中间文件路径)
+    YC-->>DW: filepath(或 video/audio 双路径)
+
+    alt 音视频分离, 需要合并 (task.needs_merge == True)
+        DW-->>DM: emit task_status_changed(task_id, MERGING)
+        DM-->>MW: UI 显示「合并中」(进度条切换为忙碌态)
+        DW->>FM: merge(video_path, audio_path, out_path)
+        FM->>FM: subprocess ffmpeg -i v -i a -c copy out.mp4 (CREATE_NO_WINDOW)
+        alt 合并成功
+            FM-->>DW: out_path
+            DW->>DW: 删除中间分片文件
+        else 合并失败
+            FM-->>DW: raise MergeError(stderr 摘要)
+            DW-->>DM: emit task_failed(task_id, "ffmpeg 合并失败: ...")
+        end
+    end
+
+    DW-->>DM: emit task_finished(task_id, filepath)
+    DM->>DM: task.status = COMPLETED, finished_at = now
+    DM->>HS: add(task) 写入历史记录(SQLite)
+    DM-->>MW: emit task_updated(task_id) + stats_updated
+    MW-->>U: 行状态「已完成」+ 系统托盘/状态栏提示 + [打开目录] 可用
+    DM->>DM: _schedule() 拉起队列中下一个 QUEUED 任务
+
+    alt 下载失败且 retry_count < max_retries
+        DW-->>DM: emit task_failed(task_id, msg)
+        DM->>DM: retry_count += 1, 指数退避(2^n s) 后重新入队
+        DM-->>MW: emit task_updated -> 显示「重试中 (2/3)」
+    else 重试耗尽
+        DM->>DM: task.status = FAILED
+        DM-->>MW: emit task_updated -> 显示失败原因 + [重试] 按钮
+    end

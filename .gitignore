@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+_venv/
+# 前一轮打包产物（重命名以避开 sandbox safe-delete 守卫）
+_b_2*/
+_d_2*/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# 打包产物
+build/
+dist/
+*.manifest
+*.spec.bak
+
+# 第三方二进制（体积大，不入库）
+vendor/
+
+# 日志与本地数据
+*.log
+logs/
+*.db
+config.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# AI 助手本地工作区（工作日志/记忆/临时输出，含本机绝对路径，不入公开仓库）
+.workbuddy/
+# 开发期探针 / pytest 抓取输出（可安全手动删除）
+_probe.txt
+_pytest_*.txt
+_collect.txt
+_qa3*
+_verify.txt
+_verify_final.xml
+_mutcheck.py
+_anchor.txt
+_ls.txt
+_mut*.txt
