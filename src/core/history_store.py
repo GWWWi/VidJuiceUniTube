@@ -51,6 +51,9 @@ _COLUMNS: tuple[str, ...] = (
     "finished_at",
 )
 
+#: 全列查询子句，供 list / search / get 复用，避免散落拼接。
+_SELECT_COLUMNS: str = ", ".join(_COLUMNS)
+
 
 class HistoryStore:
     """已完成下载任务的历史记录仓库。"""
@@ -180,7 +183,7 @@ class HistoryStore:
         try:
             with self._lock:
                 cursor = conn.execute(
-                    f"SELECT {', '.join(_COLUMNS)} FROM history"
+                    f"SELECT {_SELECT_COLUMNS} FROM history"
                     " ORDER BY finished_at DESC, id DESC LIMIT ?",
                     (int(limit),),
                 )
@@ -208,7 +211,7 @@ class HistoryStore:
         try:
             with self._lock:
                 cursor = conn.execute(
-                    f"SELECT {', '.join(_COLUMNS)} FROM history"
+                    f"SELECT {_SELECT_COLUMNS} FROM history"
                     " WHERE title LIKE ? OR url LIKE ?"
                     " ORDER BY finished_at DESC, id DESC LIMIT ?",
                     (pattern, pattern, int(limit)),
@@ -231,7 +234,7 @@ class HistoryStore:
         try:
             with self._lock:
                 cursor = conn.execute(
-                    f"SELECT {', '.join(_COLUMNS)} FROM history WHERE id = ?",
+                    f"SELECT {_SELECT_COLUMNS} FROM history WHERE id = ?",
                     (int(record_id),),
                 )
                 row = cursor.fetchone()

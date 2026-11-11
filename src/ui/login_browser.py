@@ -442,10 +442,20 @@ class LoginBrowserDialog(QDialog):
         cookies = self._collect_cookies()
         if cookies:
             try:
-                path = apply_cookies(self._config, cookies)
-                logger.info(
-                    "登录对话框关闭，自动 export %d 条 cookie 到 %s", len(cookies), path
-                )
+                # 关窗不能无条件覆盖：用户可能只是打开看一眼、没登录就关掉，
+                # 此时 cookies 里只有访客态，写下去会把上一次可用的登录态文件
+                # 冲掉（表现为「以前能下 1080p，现在突然要登录」）。
+                existing = self._config.cookiefile()
+                exists = bool(existing) and Path(existing).is_file()
+                if has_login_state(cookies) or not exists:
+                    path = apply_cookies(self._config, cookies)
+                    logger.info(
+                        "登录对话框关闭，自动 export %d 条 cookie 到 %s", len(cookies), path
+                    )
+                else:
+                    logger.info(
+                        "关闭时未检测到登录态，保留已有 cookie 文件不覆盖：%s", existing
+                    )
             except Exception as exc:  # noqa: BLE001 - 关闭路径绝不能弹错打断用户
                 logger.warning("关闭时自动 export cookies 失败：%s", exc)
         super().closeEvent(event)

@@ -10,14 +10,18 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from src.constants import BUNDLED_FFMPEG_REL, FFMPEG_TIMEOUT
-from src.core.exceptions import MergeError
+from src.core.exceptions import DownloadAbort, MergeError
 from src.utils.paths import resource_path
-from src.utils.proc import run_hidden
+from src.utils.proc import popen_hidden, run_hidden
 
 logger = logging.getLogger(__name__)
+
+#: 这些视频容器的编码（h264/h265）无法用 ``-c copy`` 写进 webm。
+_WEBM_INCOMPATIBLE = (".mp4", ".mkv", ".flv", ".ts", ".mov")
 
 
 class FfmpegMerger:
@@ -109,19 +113,22 @@ class FfmpegMerger:
     # ------------------------------------------------------------------
     # 合并
     # ------------------------------------------------------------------
-    def merge(self, video_path: str, audio_path: str, out_path: str) -> str:
+    def merge(self, video_path: str, audio_path: str, out_path: str,
+              cancel_event=None) -> str:
         """把独立的视频流与音频流合并为单一文件（流复制，不重编码）。
 
         Args:
             video_path: 视频分片路径。
             audio_path: 音频分片路径。
             out_path: 输出文件路径。
+            cancel_event: 可选的 ``threading.Event``；置位后立即终止 ffmpeg。
 
         Returns:
-            合并后的文件绝对路径。
+            合并后的文件绝对路径（可能因容器兼容性被改为 ``.mkv``）。
 
         Raises:
             MergeError: 输入缺失、ffmpeg 不可用、超时或合并失败。
+            DownloadAbort: ``cancel_event`` 被置位。
         """
         if not video_path or not Path(video_path).is_file():
             raise MergeError("合并失败：视频分片不存在", detail=str(video_path))
@@ -129,7 +136,7 @@ class FfmpegMerger:
             raise MergeError("合并失败：音频分片不存在", detail=str(audio_path))
 
         ffmpeg = self.binary_path()
-        out_abs = os.path.abspath(out_path)
+        out_abs = os.path.abspath(self._ensure_container_compatible(video_path, out_path))
         os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
 
         cmd = [
@@ -141,27 +148,80 @@ class FfmpegMerger:
             "-i", os.path.abspath(audio_path),
             "-c:v", "copy",
             "-c:a", "copy",
-            "-movflags", "+faststart",
-            out_abs,
         ]
+        # faststart 只对 mp4/isobmff 有意义，加给 mkv/webm 只会多一次无谓扫描
+        if out_abs.lower().endswith(".mp4"):
+            cmd += ["-movflags", "+faststart"]
+        cmd.append(out_abs)
 
         logger.info("开始合并音视频 → %s", out_abs)
         try:
-            result = run_hidden(cmd, timeout=FFMPEG_TIMEOUT)
-        except subprocess.TimeoutExpired as exc:
-            raise MergeError(f"音视频合并超时（超过 {FFMPEG_TIMEOUT} 秒）", detail=str(exc)) from exc
+            proc = popen_hidden(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
         except OSError as exc:
             raise MergeError("音视频合并失败：无法启动 ffmpeg", detail=str(exc)) from exc
 
-        if result.returncode != 0:
-            summary = self._tail_stderr(result.stderr)
-            raise MergeError(f"ffmpeg 合并失败：{summary}", detail=str(result.stderr or ""))
+        deadline = time.monotonic() + FFMPEG_TIMEOUT
+        stderr = ""
+        try:
+            # 轮询而非 communicate(timeout=FFMPEG_TIMEOUT)：后者在 600s 内
+            # 完全不响应取消请求，用户点「取消」要等 10 分钟才生效。
+            while True:
+                try:
+                    _out, stderr = proc.communicate(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel_event is not None and cancel_event.is_set():
+                        self._kill(proc)
+                        logger.info("合并已按用户请求取消：%s", out_abs)
+                        raise DownloadAbort("合并已被取消")
+                    if time.monotonic() > deadline:
+                        self._kill(proc)
+                        raise MergeError(f"音视频合并超时（超过 {FFMPEG_TIMEOUT} 秒）")
+        finally:
+            if proc.poll() is None:
+                self._kill(proc)
+
+        if proc.returncode != 0:
+            summary = self._tail_stderr(stderr)
+            raise MergeError(f"ffmpeg 合并失败：{summary}", detail=str(stderr or ""))
 
         if not Path(out_abs).is_file():
             raise MergeError("ffmpeg 合并失败：未生成输出文件", detail=out_abs)
 
         logger.info("合并完成：%s", out_abs)
         return out_abs
+
+    @staticmethod
+    def _ensure_container_compatible(video_path: str, out_path: str) -> str:
+        """webm 容器只接受 VP8/VP9/AV1；遇到 mp4 系分片时降级为 mkv。
+
+        否则 ``-c copy`` 会以 ``Only VP8 or VP9 or AV1 video ...`` 失败，
+        而错误又被分类成「合并失败」，用户会去折腾 ffmpeg 路径。
+        """
+        if os.path.splitext(out_path)[1].lower() != ".webm":
+            return out_path
+        if os.path.splitext(video_path)[1].lower() in _WEBM_INCOMPATIBLE:
+            alt = str(Path(out_path).with_suffix(".mkv"))
+            logger.warning("webm 容器不支持该视频编码，改为输出 mkv：%s", alt)
+            return alt
+        return out_path
+
+    @staticmethod
+    def _kill(proc: subprocess.Popen) -> None:
+        """强制结束 ffmpeg 并回收句柄，避免留下孤儿进程继续写盘。"""
+        try:
+            proc.kill()
+            proc.communicate(timeout=5)
+        except Exception:  # noqa: BLE001 - 清理路径不应再抛
+            logger.debug("终止 ffmpeg 进程失败", exc_info=True)
 
     def cleanup_parts(self, *paths: str) -> None:
         """删除合并后残留的中间分片文件（失败只记日志）。

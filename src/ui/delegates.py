@@ -56,6 +56,11 @@ _BUTTON_SPACING = 6
 _BUTTON_PADDING = 12
 
 
+def _metrics(painter: QPainter | None) -> QFontMetrics:
+    """返回可用于测量文字宽度的字体度量（无画笔时退化为应用默认字体）。"""
+    return QFontMetrics(painter.font()) if painter else QFontMetrics(QApplication.font())
+
+
 class ProgressBarDelegate(QStyledItemDelegate):
     """进度列自绘委托。"""
 
@@ -247,7 +252,7 @@ class ActionButtonDelegate(QStyledItemDelegate):
         if not actions:
             return []
 
-        metrics = QFontMetrics(painter.font()) if painter else QFontMetrics(QApplication.font())
+        metrics = _metrics(painter)
         widths = [metrics.horizontalAdvance(ACTION_TEXT_MAP.get(a, a)) + _BUTTON_PADDING * 2 for a in actions]
         total = sum(widths) + _BUTTON_SPACING * (len(actions) - 1)
 

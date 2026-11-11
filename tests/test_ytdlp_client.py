@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -430,16 +431,23 @@ class TestFfmpegMerger:
         exe = tmp_path / "ffmpeg.exe"
         exe.write_bytes(b"MZ")
 
-        class _Result:
+        class _FakeProc:
             returncode = 0
-            stdout = ""
-            stderr = ""
 
-        def _fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
-            Path(cmd[-1]).write_bytes(b"merged")
-            return _Result()
+            def __init__(self, cmd, **kwargs):  # type: ignore[no-untyped-def]
+                Path(cmd[-1]).write_bytes(b"merged")
 
-        monkeypatch.setattr("src.core.ffmpeg_merger.run_hidden", _fake_run)
+            def communicate(self, timeout=None):  # type: ignore[no-untyped-def]
+                return "", ""
+
+            def poll(self):  # type: ignore[no-untyped-def]
+                return self.returncode
+
+            def kill(self):  # type: ignore[no-untyped-def]
+                pass
+
+        # merge() 现在用 Popen 轮询以便响应取消，因此替身换成 popen_hidden
+        monkeypatch.setattr("src.core.ffmpeg_merger.popen_hidden", _FakeProc)
 
         merger = FfmpegMerger(str(exe))
         assert merger.merge(str(video), str(audio), str(out)) == str(out.resolve())
@@ -454,16 +462,65 @@ class TestFfmpegMerger:
         exe = tmp_path / "ffmpeg.exe"
         exe.write_bytes(b"MZ")
 
-        class _Result:
+        class _FakeProc:
             returncode = 1
-            stdout = ""
-            stderr = "line1\nline2\nfatal: bad input"
 
-        monkeypatch.setattr("src.core.ffmpeg_merger.run_hidden", lambda cmd, **kw: _Result())
+            def __init__(self, cmd, **kwargs):  # type: ignore[no-untyped-def]
+                pass
+
+            def communicate(self, timeout=None):  # type: ignore[no-untyped-def]
+                return "", "line1\nline2\nfatal: bad input"
+
+            def poll(self):  # type: ignore[no-untyped-def]
+                return self.returncode
+
+            def kill(self):  # type: ignore[no-untyped-def]
+                pass
+
+        monkeypatch.setattr("src.core.ffmpeg_merger.popen_hidden", _FakeProc)
 
         with pytest.raises(MergeError) as exc_info:
             FfmpegMerger(str(exe)).merge(str(video), str(audio), str(tmp_path / "o.mp4"))
         assert "fatal: bad input" in exc_info.value.message
+
+    def test_merge_aborts_when_cancel_requested(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """置位 cancel_event 后合并必须尽快中断并抛 DownloadAbort。"""
+        import threading
+
+        video = tmp_path / "v.mp4"
+        audio = tmp_path / "a.m4a"
+        video.write_bytes(b"v")
+        audio.write_bytes(b"a")
+        exe = tmp_path / "ffmpeg.exe"
+        exe.write_bytes(b"MZ")
+
+        killed: list[bool] = []
+
+        class _HangingProc:
+            returncode = None
+
+            def __init__(self, cmd, **kwargs):  # type: ignore[no-untyped-def]
+                pass
+
+            def communicate(self, timeout=None):  # type: ignore[no-untyped-def]
+                raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout or 0)
+
+            def poll(self):  # type: ignore[no-untyped-def]
+                return None
+
+            def kill(self):  # type: ignore[no-untyped-def]
+                killed.append(True)
+
+        monkeypatch.setattr("src.core.ffmpeg_merger.popen_hidden", _HangingProc)
+
+        cancel = threading.Event()
+        cancel.set()
+        with pytest.raises(DownloadAbort):
+            FfmpegMerger(str(exe)).merge(str(video), str(audio),
+                                         str(tmp_path / "o.mp4"), cancel_event=cancel)
+        assert killed, "取消时必须 kill 掉 ffmpeg 进程"
 
     def test_cleanup_parts_is_safe(self, tmp_path: Path) -> None:
         """清理不存在的文件不报错。"""

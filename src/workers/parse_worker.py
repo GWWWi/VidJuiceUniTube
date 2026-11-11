@@ -45,8 +45,15 @@ class ParseWorker(QRunnable):
             self.signals.parse_finished.emit(info)
             self.signals.log_message.emit(f"解析成功：{info.title}")
         except Exception as exc:  # noqa: BLE001 - 子线程必须吞掉所有异常
-            cookie_path = self._client._config.cookiefile()  # type: ignore[attr-defined]
-            message = YtDlpClient.probe_error(exc, cookie_path=cookie_path)
+            # 错误翻译自身也可能失败（客户端为测试替身等），再包一层兜底，
+            # 保证 parse_failed 信号必定发出，主线程不会一直停在「解析中」。
+            try:
+                getter = getattr(self._client, "cookie_path", None)
+                cookie_path = getter() if callable(getter) else None
+                message = YtDlpClient.probe_error(exc, cookie_path=cookie_path)
+            except Exception:  # noqa: BLE001
+                logger.error("错误翻译失败，回退为原始异常文案", exc_info=True)
+                message = f"解析失败：{exc}"
             logger.warning("ParseWorker 解析失败 %s：%s", self._url, exc, exc_info=False)
             try:
                 self.signals.parse_failed.emit(self._url, message)

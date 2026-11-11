@@ -22,6 +22,26 @@ from src.constants import (
 from src.core.format_utils import human_size, resolution_label
 
 
+def _safe_int(value: Any) -> int | None:
+    """把任意值安全转换为 ``int``，失败或为空返回 ``None``。"""
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    """把任意值安全转换为 ``float``，失败或为空返回 ``None``。"""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class TaskStatus(str, Enum):
     """下载任务状态枚举（值为英文小写，UI 展示走 ``STATUS_TEXT_MAP``）。"""
 
@@ -103,36 +123,22 @@ class MediaFormat:
         """
         vcodec = str(d.get("vcodec") or "none")
         acodec = str(d.get("acodec") or "none")
-        height = d.get("height")
-        try:
-            height_int: int | None = int(height) if height else None
-        except (TypeError, ValueError):
-            height_int = None
-
-        fps_raw = d.get("fps")
-        try:
-            fps_int: int | None = int(round(float(fps_raw))) if fps_raw else None
-        except (TypeError, ValueError):
-            fps_int = None
-
-        filesize_raw = d.get("filesize") or d.get("filesize_approx")
-        try:
-            filesize_val: float | None = float(filesize_raw) if filesize_raw else None
-        except (TypeError, ValueError):
-            filesize_val = None
+        height = _safe_int(d.get("height"))
+        fps = _safe_int(d.get("fps"))
+        filesize = _safe_float(d.get("filesize") or d.get("filesize_approx"))
 
         # 纯视频流（无音轨）需要额外合并音频
         needs_merge = acodec == "none" and vcodec != "none"
 
-        resolution = str(d.get("resolution") or "") or resolution_label(height_int)
+        resolution = str(d.get("resolution") or "") or resolution_label(height)
 
         fmt = MediaFormat(
             format_id=str(d.get("format_id") or ""),
             ext=str(d.get("ext") or "mp4"),
             resolution=resolution,
-            height=height_int,
-            fps=fps_int,
-            filesize=filesize_val,
+            height=height,
+            fps=fps,
+            filesize=filesize,
             vcodec=vcodec,
             acodec=acodec,
             needs_merge=needs_merge,
@@ -348,26 +354,10 @@ class ProgressInfo:
         """
         data = dict(d or {})
 
-        def _to_int(value: Any) -> int | None:
-            try:
-                if value is None:
-                    return None
-                return int(float(value))
-            except (TypeError, ValueError):
-                return None
-
-        def _to_float(value: Any) -> float | None:
-            try:
-                if value is None:
-                    return None
-                return float(value)
-            except (TypeError, ValueError):
-                return None
-
-        downloaded = _to_int(data.get("downloaded_bytes")) or 0
-        total = _to_int(data.get("total_bytes"))
+        downloaded = _safe_int(data.get("downloaded_bytes")) or 0
+        total = _safe_int(data.get("total_bytes"))
         if total is None:
-            total = _to_int(data.get("total_bytes_estimate"))
+            total = _safe_int(data.get("total_bytes_estimate"))
 
         status = str(data.get("status") or "")
         if status == "finished":
@@ -379,8 +369,8 @@ class ProgressInfo:
         else:
             percent = -1.0  # 总量未知，UI 显示忙碌样式
 
-        speed = _to_float(data.get("speed")) or 0.0
-        eta = _to_float(data.get("eta"))
+        speed = _safe_float(data.get("speed")) or 0.0
+        eta = _safe_float(data.get("eta"))
 
         return ProgressInfo(
             percent=percent,
@@ -543,4 +533,6 @@ __all__ = [
     "MediaInfo",
     "ProgressInfo",
     "TaskStatus",
+    "_safe_float",
+    "_safe_int",
 ]

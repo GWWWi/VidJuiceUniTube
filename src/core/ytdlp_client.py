@@ -26,7 +26,7 @@ from src.constants import (
 from src.core.config_store import ConfigStore
 from src.core.exceptions import DownloadAbort, DownloadPause, ParseError
 from src.core.format_utils import quality_sort_key
-from src.core.models import DownloadTask, MediaFormat, MediaInfo
+from src.core.models import DownloadTask, MediaFormat, MediaInfo, _safe_int
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,19 @@ class YtDlpClient:
             config: 配置存取器，用于读取 cookie / 代理 / ffmpeg 路径。
         """
         self._config: ConfigStore = config
+
+    def cookie_path(self) -> str | None:
+        """当前生效的 cookies 文件路径（供错误提示 / 日志使用）。
+
+        Worker 不应该直接访问 ``_config``——那是实现细节，测试替身也不会提供。
+        暴露一个语义明确的公有方法，既解耦也让失败路径不会因为
+        ``AttributeError`` 把异常再次抛出 ``run()``。
+        """
+        try:
+            return self._config.cookiefile()
+        except Exception:  # noqa: BLE001 - 仅用于提示文案，取不到就当没有
+            logger.debug("读取 cookiefile 路径失败", exc_info=True)
+            return None
 
     # ------------------------------------------------------------------
     # opts 构建
@@ -267,17 +280,11 @@ class YtDlpClient:
         # 置顶插入伪「最佳画质（自动）」作为默认项
         formats.insert(0, MediaFormat.make_best())
 
-        duration_raw = raw.get("duration")
-        try:
-            duration = int(float(duration_raw)) if duration_raw else None
-        except (TypeError, ValueError):
-            duration = None
-
         info = MediaInfo(
             url=str(raw.get("webpage_url") or url),
             title=str(raw.get("title") or "未命名视频"),
             uploader=raw.get("uploader") or raw.get("channel") or raw.get("uploader_id"),
-            duration=duration,
+            duration=_safe_int(raw.get("duration")),
             thumbnail=raw.get("thumbnail"),
             extractor=str(raw.get("extractor_key") or raw.get("extractor") or ""),
             formats=formats,

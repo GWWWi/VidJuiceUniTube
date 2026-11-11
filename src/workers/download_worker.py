@@ -10,6 +10,7 @@ from __future__ import annotations
 import glob
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,6 @@ from src.core.exceptions import DownloadAbort, DownloadPause, MergeError
 from src.core.ffmpeg_merger import FfmpegMerger
 from src.core.models import DownloadTask, ProgressInfo, TaskStatus
 from src.core.ytdlp_client import YtDlpClient
-from src.utils.paths import sanitize_filename
 from src.workers.signals import WorkerSignals
 
 logger = logging.getLogger(__name__)
@@ -48,12 +48,14 @@ class DownloadWorker(QRunnable):
         self._client: YtDlpClient = client
         self._merger: FfmpegMerger = merger
 
-        import threading
-
         self._abort: threading.Event = threading.Event()
         self._pause: threading.Event = threading.Event()
         self._last_emit: float = 0.0
         self._finished: bool = False
+        # 本任务实际触达的媒体 id 与目标文件名：取消时据此精确清理临时文件，
+        # 不再靠「标题前 10 个字符」猜——那样会把同名前缀的其他任务一起删掉。
+        self._media_ids: set[str] = set()
+        self._seen_files: set[str] = set()
 
         self.setAutoDelete(False)  # 暂停后仍需保留对象，由 Manager 管理生命周期
 
@@ -99,6 +101,16 @@ class DownloadWorker(QRunnable):
         if self._pause.is_set():
             raise DownloadPause(task_id=self._task.task_id)
 
+        # 记录本次下载的真实身份：id 用于精确匹配临时文件，filename 兜底。
+        payload = d or {}
+        info = payload.get("info_dict") or {}
+        media_id = info.get("id")
+        if media_id:
+            self._media_ids.add(str(media_id))
+        filename = payload.get("filename")
+        if filename:
+            self._seen_files.add(os.path.abspath(str(filename)))
+
         status = str((d or {}).get("status") or "")
         now = time.monotonic()
         if now - self._last_emit < PROGRESS_EMIT_INTERVAL and status != "finished":
@@ -133,12 +145,20 @@ class DownloadWorker(QRunnable):
             self._emit_status(TaskStatus.DOWNLOADING)
             filepath = self._client.download(task, self._on_progress, self._abort)
 
-            # yt-dlp 通常已内部合并；若产物缺失则尝试用 FfmpegMerger 兜底
+            if self._abort.is_set():
+                raise DownloadAbort(task_id=task.task_id)
+
+            # yt-dlp 通常已内部合并；若产物缺失且本任务需要合并，再用 ffmpeg 兜底。
             if task.needs_merge and not self._file_ready(filepath):
                 filepath = self._fallback_merge(filepath)
 
-            if self._abort.is_set():
-                raise DownloadAbort(task_id=task.task_id)
+            # 产物校验对所有格式生效。合流格式（format 18、bilibili durl 等）
+            # needs_merge=False，之前完全不校验：一旦扩展名推断错，就会把一个
+            # 不存在的路径当成功上报，界面显示「已完成」而目录里什么都没有。
+            if not self._file_ready(filepath):
+                logger.error("下载结束但未找到产物：%s | 推断路径=%s", task.title, filepath)
+                self._emit_failed("下载结束但未找到产物文件，请重试；若反复出现请检查下载目录权限与磁盘空间")
+                return
 
             self._emit_progress(ProgressInfo(percent=100.0, phase="downloading"))
             try:
@@ -161,9 +181,18 @@ class DownloadWorker(QRunnable):
             self._emit_failed(exc.message)
 
         except Exception as exc:  # noqa: BLE001 - 子线程必须吞掉所有异常
-            cookie_path = self._client._config.cookiefile()  # type: ignore[attr-defined]
-            message = YtDlpClient.probe_error(exc, cookie_path=cookie_path)
-            logger.error("下载失败：%s | %s", task.title, exc, exc_info=False)
+            # 注意：这里是失败**兜底**路径，自身绝不能再抛异常。
+            # 原实现直接访问 self._client._config，客户端一旦是替身或实现变更，
+            # AttributeError 会逃出 run()，task_failed 永不发出 → 任务永久停在
+            # DOWNLOADING，并发名额泄漏且只能重启。
+            try:
+                getter = getattr(self._client, "cookie_path", None)
+                cookie_path = getter() if callable(getter) else None
+                message = YtDlpClient.probe_error(exc, cookie_path=cookie_path)
+            except Exception:  # noqa: BLE001
+                logger.error("错误翻译失败，回退为原始异常文案", exc_info=True)
+                message = f"下载失败：{exc}"
+            logger.error("下载失败：%s | %s", task.title, exc, exc_info=True)
             self._emit_failed(message)
 
         finally:
@@ -225,38 +254,53 @@ class DownloadWorker(QRunnable):
                 detail=f"expected={expected_path}, candidates={candidates}",
             )
 
-        out_path = self._merger.merge(video_part, audio_part, expected_path)
+        out_path = self._merger.merge(video_part, audio_part, expected_path,
+                                      cancel_event=self._abort)
         self._merger.cleanup_parts(video_part, audio_part)
         return out_path
 
     def _cleanup_temp_files(self) -> None:
         """取消后清理**本任务**的 ``.part`` / ``.ytdl`` 临时文件。
 
-        为避免误删其他并发任务的临时文件，只清理文件名前缀与本任务标题
-        匹配的项（yt-dlp 的 outtmpl 以标题开头）。
+        匹配依据（按可靠性排序）：
+          1. yt-dlp 在 progress hook 里回报的媒体 id —— ``OUTPUT_TEMPLATE``
+             形如 ``%(title).150B [%(id)s].%(ext)s``，``[id]`` 全局唯一；
+          2. 本次实际触达的目标文件名（``d["filename"]``）。
+
+        绝不按标题前缀猜：原实现比较标题前 10 个字符，而 yt-dlp 会自行净化
+        文件名，「Python 教程 第1集」与「第2集」前 10 字符完全相同——取消 A
+        会把处于暂停态（无文件句柄、Windows 不拦截删除）的 B 的已下载进度
+        静默删掉，B 恢复时从 0 重下。
         """
         output_dir = self._task.output_dir
         if not output_dir or not os.path.isdir(output_dir):
             return
 
-        prefix = sanitize_filename(self._task.title or "")[:40].strip()
-        if not prefix:
-            logger.debug("任务标题为空，跳过临时文件清理")
+        targets: set[str] = set()
+        for media_id in self._media_ids:
+            # glob.escape 处理 ``[`` / ``*`` / ``?``，避免把 [id] 当成字符类
+            tag = glob.escape(f"[{media_id}]")
+            targets.update(glob.glob(os.path.join(output_dir, f"*{tag}*.part*")))
+            targets.update(glob.glob(os.path.join(output_dir, f"*{tag}*.ytdl")))
+
+        for filename in self._seen_files:
+            literal = glob.escape(filename)
+            targets.update(glob.glob(literal + ".part*"))
+            targets.update(glob.glob(literal + ".ytdl"))
+            # 分片下载的目标形如 ``xxx.f137.mp4``，其 .part 位于同一 stem 下
+            stem = glob.escape(os.path.splitext(filename)[0])
+            targets.update(glob.glob(stem + "*.part*"))
+
+        if not targets:
+            logger.debug("未识别到本任务的临时文件，跳过清理（不按标题猜测）")
             return
 
-        try:
-            for pattern in ("*.part", "*.ytdl", "*.part-Frag*"):
-                for path in glob.glob(os.path.join(output_dir, pattern)):
-                    name = os.path.basename(path)
-                    if not name.startswith(prefix[:10]):
-                        continue  # 不属于本任务，跳过
-                    try:
-                        os.remove(path)
-                        logger.debug("已清理临时文件：%s", path)
-                    except OSError as exc:
-                        logger.debug("清理临时文件失败 %s：%s", path, exc)
-        except OSError as exc:
-            logger.warning("清理临时文件时出错：%s", exc)
+        for path in targets:
+            try:
+                os.remove(path)
+                logger.debug("已清理临时文件：%s", path)
+            except OSError as exc:
+                logger.debug("清理临时文件失败 %s：%s", path, exc)
 
 
 __all__ = ["DownloadWorker"]
